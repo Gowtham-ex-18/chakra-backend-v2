@@ -1,0 +1,90 @@
+# Opens a pull request into `develop` whenever a feature branch is pushed.
+#
+#   - Pushes to `main` or `develop`      -> ignored (no PR)
+#   - Branch already has an open PR      -> nothing to do, the push just updates that PR
+#   - Branch has no open PR yet          -> a new PR <branch> -> develop is created
+#   - Branch has no new commits vs develop -> skipped (GitHub would reject an empty PR)
+
+name: Auto PR to develop
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - develop
+
+# Only what this job needs
+permissions:
+  contents: read
+  pull-requests: write
+
+# Two quick pushes to the same branch run one after another, so they can't both create a PR
+concurrency:
+  group: auto-pr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-pr:
+    name: Create PR if missing
+    # Deleting a branch also sends a push event; skip those
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Open a PR into develop (only if one isn't open already)
+        env:
+          # Optional: add a repo secret AUTO_PR_TOKEN (a PAT) so the new PR also
+          # triggers your other pull_request workflows (e.g. CI). Without it,
+          # the built-in GITHUB_TOKEN is used.
+          GH_TOKEN: ${{ secrets.AUTO_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          BASE: develop
+          # Passed through env (never inlined in the script) so commit text can't inject shell commands
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          # 1. Is there already an open PR from this branch into develop?
+          existing=$(gh pr list \
+            --repo "$REPO" \
+            --head "$BRANCH" \
+            --base "$BASE" \
+            --state open \
+            --json number,url \
+            --jq '.[0].url // empty')
+
+          if [ -n "$existing" ]; then
+            echo "An open PR already exists: $existing"
+            echo "The push has updated it. Nothing else to do."
+            exit 0
+          fi
+
+          # 2. Does the branch have commits that develop doesn't?
+          ahead=$(gh api "repos/$REPO/compare/$BASE...$BRANCH" --jq '.ahead_by')
+          if [ "$ahead" = "0" ]; then
+            echo "Branch '$BRANCH' has no new commits compared to $BASE. Skipping."
+            exit 0
+          fi
+
+          # 3. Create the PR. Title = first line of the latest commit message.
+          title=$(printf '%s' "$COMMIT_MESSAGE" | head -n 1)
+          if [ -z "$title" ]; then
+            title="$BRANCH"
+          fi
+
+          body=$(printf '%s\n\n%s\n%s\n' \
+            "Automatically opened for branch \`$BRANCH\` → \`$BASE\`." \
+            "- Pushed by: @$ACTOR" \
+            "- Commits ahead of $BASE: $ahead")
+
+          url=$(gh pr create \
+            --repo "$REPO" \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "$title" \
+            --body "$body")
+
+          echo "Created PR: $url"
+          echo "### PR created: $url" >> "$GITHUB_STEP_SUMMARY"
