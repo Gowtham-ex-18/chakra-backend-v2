@@ -43,11 +43,11 @@ jobs:
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.HOSTINGER_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
-          printf '%s\n' "$KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
+          ssh-keyscan -p "$PORT" -t ed25519,ecdsa,rsa "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+          test -s ~/.ssh/known_hosts || { echo "ssh-keyscan failed: cannot reach $HOST:$PORT"; exit 1; }
           cat > ~/.ssh/config <<EOF
           Host hostinger
             HostName $HOST
