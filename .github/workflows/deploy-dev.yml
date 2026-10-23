@@ -18,44 +18,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout source code
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
 
-      # 3. Install and build
       - name: Install Dependencies
         run: npm ci
 
       - name: Build Application
         run: npm run build
 
-      # 4. Package application (without .env)
       - name: Package Application
         run: |
+          set -euo pipefail
           test -f dist/main.js
           tar -czf /tmp/app.tar.gz \
-            dist src package.json package-lock.json
+            dist package.json package-lock.json
 
-      # 5. Configure SSH
       - name: Configure SSH
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.HOSTINGER_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
+          : "${SSH_KEY:?HOSTINGER_SSH_KEY is missing}"
+          : "${KNOWN_HOSTS:?HOSTINGER_KNOWN_HOSTS is missing}"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-      # 6. Upload application
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
       - name: Upload Application
         env:
           HOST: ${{ secrets.HOSTINGER_HOST }}
@@ -63,6 +65,12 @@ jobs:
           USER: ${{ secrets.HOSTINGER_USER }}
           APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
         run: |
+          set -euo pipefail
+          : "${HOST:?HOSTINGER_HOST is missing}"
+          : "${PORT:?HOSTINGER_PORT variable is missing}"
+          : "${USER:?HOSTINGER_USER is missing}"
+          : "${APP_DIR:?HOSTINGER_APP_DIR is missing}"
+
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=yes \
             -p "$PORT" "$USER@$HOST" \
@@ -73,15 +81,21 @@ jobs:
             -P "$PORT" /tmp/app.tar.gz \
             "$USER@$HOST:$APP_DIR/deploy.tar.gz"
 
-      # 7. Deploy and restart PM2
-      - name: Deploy to Hostinger
+      - name: Deploy and Restart PM2
         env:
           HOST: ${{ secrets.HOSTINGER_HOST }}
-          PORT: ${{ secrets.HOSTINGER_PORT }}
+          PORT: ${{ vars.HOSTINGER_PORT }}
           USER: ${{ secrets.HOSTINGER_USER }}
           APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
           APP_NAME: ${{ vars.PM2_APP_NAME }}
         run: |
+          set -euo pipefail
+          : "${HOST:?HOSTINGER_HOST is missing}"
+          : "${PORT:?HOSTINGER_PORT variable is missing}"
+          : "${USER:?HOSTINGER_USER is missing}"
+          : "${APP_DIR:?HOSTINGER_APP_DIR is missing}"
+          : "${APP_NAME:?PM2_APP_NAME is missing}"
+
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=yes \
             -p "$PORT" "$USER@$HOST" \
@@ -92,40 +106,56 @@ jobs:
           APP_NAME="$2"
           RELEASE="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
           CURRENT="$APP_DIR/current"
+          PREVIOUS=""
 
-          # Preserve the existing server environment file
+          if [ -L "$CURRENT" ]; then
+            PREVIOUS="$(readlink -f "$CURRENT")"
+          fi
+
           test -f "$APP_DIR/.env.staging"
           test -s "$APP_DIR/deploy.tar.gz"
 
           mkdir -p "$RELEASE"
           tar -xzf "$APP_DIR/deploy.tar.gz" -C "$RELEASE"
 
-          # Link existing environment file; do not overwrite it
+          # Preserve the existing environment file.
           ln -s "$APP_DIR/.env.staging" "$RELEASE/.env"
 
           cd "$RELEASE"
-          npm ci
+          npm ci --omit=dev
 
-          # Activate new release
+          # Switch current release atomically.
           ln -s "$RELEASE" "$APP_DIR/current.new"
           mv -Tf "$APP_DIR/current.new" "$CURRENT"
 
-          # Restart application
+          # Explicitly point PM2 at the new release.
           if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-            pm2 restart "$APP_NAME" --update-env
-          else
-            pm2 start "$CURRENT/dist/main.js" \
-              --name "$APP_NAME" \
-              --cwd "$CURRENT"
+            pm2 delete "$APP_NAME"
+          fi
+
+          if ! pm2 start "$CURRENT/dist/main.js" \
+            --name "$APP_NAME" \
+            --cwd "$CURRENT"; then
+
+            # Restore the previous release if one exists.
+            if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+              ln -s "$PREVIOUS" "$APP_DIR/current.rollback"
+              mv -Tf "$APP_DIR/current.rollback" "$CURRENT"
+
+              pm2 start "$CURRENT/dist/main.js" \
+                --name "$APP_NAME" \
+                --cwd "$CURRENT" || true
+            fi
+
+            exit 1
           fi
 
           pm2 save
           rm -f "$APP_DIR/deploy.tar.gz"
 
-          echo "Deployment successful."
+          echo "Deployment started successfully."
           REMOTE
 
-      # 8. Clean up GitHub runner
       - name: Cleanup
         if: always()
         run: |
