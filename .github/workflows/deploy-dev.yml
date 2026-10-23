@@ -59,7 +59,7 @@ jobs:
       - name: Upload Application
         env:
           HOST: ${{ secrets.HOSTINGER_HOST }}
-          PORT: ${{ secrets.HOSTINGER_PORT }}
+          PORT: ${{ vars.HOSTINGER_PORT }}
           USER: ${{ secrets.HOSTINGER_USER }}
           APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
         run: |
