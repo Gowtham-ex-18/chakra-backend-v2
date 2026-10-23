@@ -1,10 +1,8 @@
-
 name: Deploy NestJS Backend to Hostinger
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -13,6 +11,13 @@ permissions:
 concurrency:
   group: nestjs-hostinger-staging
   cancel-in-progress: false
+
+env:
+  PM2_APP_NAME: chakra-dev-backend   # change to your PM2 app name
+  HOST: ${{ secrets.HOSTINGER_HOST }}
+  USER: ${{ secrets.HOSTINGER_USER }}
+  PORT: ${{ vars.HOSTINGER_PORT }}
+  APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
 
 jobs:
   deploy:
@@ -28,134 +33,77 @@ jobs:
           node-version: "22"
           cache: npm
 
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Build Application
-        run: npm run build
-
-      - name: Package Application
+      - name: Install and Build
         run: |
-          set -euo pipefail
+          npm ci
+          npm run build
           test -f dist/main.js
-          tar -czf /tmp/app.tar.gz \
-            dist package.json package-lock.json
+          tar -czf /tmp/app.tar.gz dist package.json package-lock.json
 
       - name: Configure SSH
-        shell: bash
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.HOSTINGER_KNOWN_HOSTS }}
         run: |
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host hostinger
+            HostName $HOST
+            Port $PORT
+            User $USER
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts ~/.ssh/config
 
       - name: Upload Application
-        env:
-          HOST: ${{ secrets.HOSTINGER_HOST }}
-          PORT: ${{ vars.HOSTINGER_PORT }}
-          USER: ${{ secrets.HOSTINGER_USER }}
-          APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
         run: |
-          set -euo pipefail
-          : "${HOST:?HOSTINGER_HOST is missing}"
-          : "${PORT:?HOSTINGER_PORT variable is missing}"
-          : "${USER:?HOSTINGER_USER is missing}"
-          : "${APP_DIR:?HOSTINGER_APP_DIR is missing}"
-
-          ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=yes \
-            -p "$PORT" "$USER@$HOST" \
-            "mkdir -p '$APP_DIR/releases'"
-
-          scp -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=yes \
-            -P "$PORT" /tmp/app.tar.gz \
-            "$USER@$HOST:$APP_DIR/deploy.tar.gz"
+          ssh hostinger "mkdir -p '$APP_DIR/releases'"
+          scp /tmp/app.tar.gz "hostinger:$APP_DIR/deploy.tar.gz"
 
       - name: Deploy and Restart PM2
-        env:
-          HOST: ${{ secrets.HOSTINGER_HOST }}
-          PORT: ${{ vars.HOSTINGER_PORT }}
-          USER: ${{ secrets.HOSTINGER_USER }}
-          APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
-          APP_NAME: ${{ vars.PM2_APP_NAME }}
         run: |
+          ssh hostinger "bash -s -- '$APP_DIR' '$PM2_APP_NAME'" <<'REMOTE'
           set -euo pipefail
-          : "${HOST:?HOSTINGER_HOST is missing}"
-          : "${PORT:?HOSTINGER_PORT variable is missing}"
-          : "${USER:?HOSTINGER_USER is missing}"
-          : "${APP_DIR:?HOSTINGER_APP_DIR is missing}"
-          : "${APP_NAME:?PM2_APP_NAME is missing}"
-
-          ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=yes \
-            -p "$PORT" "$USER@$HOST" \
-            "bash -s -- '$APP_DIR' '$APP_NAME'" <<'REMOTE'
-          set -euo pipefail
+          [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
 
           APP_DIR="$1"
           APP_NAME="$2"
           RELEASE="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
           CURRENT="$APP_DIR/current"
-          PREVIOUS=""
-
-          if [ -L "$CURRENT" ]; then
-            PREVIOUS="$(readlink -f "$CURRENT")"
-          fi
+          PREVIOUS="$(readlink -f "$CURRENT" 2>/dev/null || true)"
 
           test -f "$APP_DIR/.env.staging"
-          test -s "$APP_DIR/deploy.tar.gz"
 
           mkdir -p "$RELEASE"
           tar -xzf "$APP_DIR/deploy.tar.gz" -C "$RELEASE"
+          ln -sfn "$APP_DIR/.env.staging" "$RELEASE/.env"
+          cd "$RELEASE" && npm ci --omit=dev --no-audit --no-fund
 
-          # Preserve the existing environment file.
-          ln -s "$APP_DIR/.env.staging" "$RELEASE/.env"
+          start() {
+            ln -sfn "$1" "$APP_DIR/current.tmp"
+            mv -Tf "$APP_DIR/current.tmp" "$CURRENT"
+            pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+            pm2 start "$CURRENT/dist/main.js" --name "$APP_NAME" --cwd "$CURRENT"
+            sleep 10
+            pm2 describe "$APP_NAME" | grep -q "status.*online"
+          }
 
-          cd "$RELEASE"
-          npm ci --omit=dev
-
-          # Switch current release atomically.
-          ln -s "$RELEASE" "$APP_DIR/current.new"
-          mv -Tf "$APP_DIR/current.new" "$CURRENT"
-
-          # Explicitly point PM2 at the new release.
-          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-            pm2 delete "$APP_NAME"
-          fi
-
-          if ! pm2 start "$CURRENT/dist/main.js" \
-            --name "$APP_NAME" \
-            --cwd "$CURRENT"; then
-
-            # Restore the previous release if one exists.
-            if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
-              ln -s "$PREVIOUS" "$APP_DIR/current.rollback"
-              mv -Tf "$APP_DIR/current.rollback" "$CURRENT"
-
-              pm2 start "$CURRENT/dist/main.js" \
-                --name "$APP_NAME" \
-                --cwd "$CURRENT" || true
-            fi
-
+          if start "$RELEASE"; then
+            pm2 save
+            rm -f "$APP_DIR/deploy.tar.gz"
+            ls -1dt "$APP_DIR"/releases/*/ | tail -n +6 | xargs -r rm -rf
+            echo "Deployed: $RELEASE"
+          else
+            pm2 logs "$APP_NAME" --lines 50 --nostream || true
+            [ -d "$PREVIOUS" ] && start "$PREVIOUS" && pm2 save
+            rm -rf "$RELEASE"
             exit 1
           fi
-
-          pm2 save
-          rm -f "$APP_DIR/deploy.tar.gz"
-
-          echo "Deployment started successfully."
           REMOTE
 
       - name: Cleanup
         if: always()
-        run: |
-          rm -f /tmp/app.tar.gz ~/.ssh/deploy_key
+        run: rm -f /tmp/app.tar.gz ~/.ssh/deploy_key ~/.ssh/config
