@@ -1,0 +1,132 @@
+name: Deploy NestJS Backend to Hostinger
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nestjs-hostinger-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout source code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # 3. Install and build
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+
+      # 4. Package application (without .env)
+      - name: Package Application
+        run: |
+          test -f dist/main.js
+          tar -czf /tmp/app.tar.gz \
+            dist src package.json package-lock.json
+
+      # 5. Configure SSH
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.HOSTINGER_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # 6. Upload application
+      - name: Upload Application
+        env:
+          HOST: ${{ secrets.HOSTINGER_HOST }}
+          PORT: ${{ secrets.HOSTINGER_PORT }}
+          USER: ${{ secrets.HOSTINGER_USER }}
+          APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" "$USER@$HOST" \
+            "mkdir -p '$APP_DIR/releases'"
+
+          scp -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            -P "$PORT" /tmp/app.tar.gz \
+            "$USER@$HOST:$APP_DIR/deploy.tar.gz"
+
+      # 7. Deploy and restart PM2
+      - name: Deploy to Hostinger
+        env:
+          HOST: ${{ secrets.HOSTINGER_HOST }}
+          PORT: ${{ secrets.HOSTINGER_PORT }}
+          USER: ${{ secrets.HOSTINGER_USER }}
+          APP_DIR: ${{ vars.HOSTINGER_APP_DIR }}
+          APP_NAME: ${{ vars.PM2_APP_NAME }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" "$USER@$HOST" \
+            "bash -s -- '$APP_DIR' '$APP_NAME'" <<'REMOTE'
+          set -euo pipefail
+
+          APP_DIR="$1"
+          APP_NAME="$2"
+          RELEASE="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
+          CURRENT="$APP_DIR/current"
+
+          # Preserve the existing server environment file
+          test -f "$APP_DIR/.env.staging"
+          test -s "$APP_DIR/deploy.tar.gz"
+
+          mkdir -p "$RELEASE"
+          tar -xzf "$APP_DIR/deploy.tar.gz" -C "$RELEASE"
+
+          # Link existing environment file; do not overwrite it
+          ln -s "$APP_DIR/.env.staging" "$RELEASE/.env"
+
+          cd "$RELEASE"
+          npm ci
+
+          # Activate new release
+          ln -s "$RELEASE" "$APP_DIR/current.new"
+          mv -Tf "$APP_DIR/current.new" "$CURRENT"
+
+          # Restart application
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            pm2 restart "$APP_NAME" --update-env
+          else
+            pm2 start "$CURRENT/dist/main.js" \
+              --name "$APP_NAME" \
+              --cwd "$CURRENT"
+          fi
+
+          pm2 save
+          rm -f "$APP_DIR/deploy.tar.gz"
+
+          echo "Deployment successful."
+          REMOTE
+
+      # 8. Clean up GitHub runner
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/app.tar.gz ~/.ssh/deploy_key
