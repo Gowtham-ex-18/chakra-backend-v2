@@ -1,3 +1,4 @@
+
 name: Deploy NestJS Backend to Hostinger
 
 on:
@@ -41,13 +42,11 @@ jobs:
             dist package.json package-lock.json
 
       - name: Configure SSH
+        shell: bash
         env:
           SSH_KEY: ${{ secrets.HOSTINGER_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.HOSTINGER_KNOWN_HOSTS }}
         run: |
-          set -euo pipefail
-          : "${SSH_KEY:?HOSTINGER_SSH_KEY is missing}"
-          : "${KNOWN_HOSTS:?HOSTINGER_KNOWN_HOSTS is missing}"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
